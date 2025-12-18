@@ -65,35 +65,35 @@ class BaseDataset(Dataset):
         return self.num_sample
 
 
-class HierarchicalTrainDataset(BaseDataset):
+class HierarchicalDataset(BaseDataset):
     """
-    Training dataset for hierarchical multi-instance learning.
-    
-    This dataset handles the loading and processing of training data with
-    hierarchical labels (coarse and fine-grained).
+    Unified dataset for hierarchical multi-instance learning.
+
+    This dataset handles the loading and processing of data with
+    hierarchical labels (coarse and fine-grained) for both training and validation.
     """
-    
+
     def __init__(self, split_data: List[Tuple[str, str, str]], cfg: DatasetConfig):
         """
-        Initialize the training dataset.
-        
+        Initialize the hierarchical dataset.
+
         Args:
             split_data: List of (sample_id, label, path) tuples
             cfg: Dataset configuration object
         """
         super().__init__(split_data, cfg)
         self.root_dataset = cfg.data_root
-        
+
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, List[int]]:
         """
         Get a data sample and its labels.
-        
+
         Args:
             index: Index of the sample to retrieve
-            
+
         Returns:
             Tuple of (record tensor, [coarse_label, fine_label])
-            
+
         Raises:
             FileNotFoundError: If the record file cannot be found
             ValueError: If the label is not in the label list
@@ -102,79 +102,21 @@ class HierarchicalTrainDataset(BaseDataset):
         try:
             record_path = self.list_sample[index][2]
             record = torch.load(record_path)
-            
+
             # Get fine-grained label
             fine_label = self.list_sample[index][1]
             if fine_label not in self.label_list:
                 raise ValueError(f"Unknown label: {fine_label}")
             patient_label_fine = self.label_list.index(fine_label)
-            
+
             # Get coarse-grained label
             if patient_label_fine not in self.mapping:
                 raise KeyError(f"No mapping found for fine label: {patient_label_fine}")
             patient_label_coarse = self.mapping[patient_label_fine]
-            
+
             return record, [patient_label_coarse, patient_label_fine]
-            
+
         except FileNotFoundError:
             raise FileNotFoundError(f"Record file not found: {record_path}")
         except Exception as e:
             raise RuntimeError(f"Error loading sample {index}: {e}")
-
-
-class HierarchicalValDataset(BaseDataset):
-    """
-    Validation dataset for hierarchical multi-instance learning.
-    
-    This dataset handles the loading and processing of validation data with
-    hierarchical labels (coarse and fine-grained).
-    """
-    
-    def __init__(self, root_dataset: str, cfg: DatasetConfig):
-        """
-        Initialize the validation dataset.
-        
-        Args:
-            root_dataset: Root directory of the dataset
-            cfg: Dataset configuration object
-        """
-        super().__init__(root_dataset, cfg)
-        self.root_dataset = root_dataset
-        
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, List[int]]:
-        """
-        Get a data sample and its labels.
-        
-        Args:
-            index: Index of the sample to retrieve
-            
-        Returns:
-            Tuple of (record tensor, [coarse_label, fine_label])
-            
-        Raises:
-            FileNotFoundError: If the record file cannot be found
-            ValueError: If the label is not in the label list
-            KeyError: If the fine label has no corresponding coarse label
-        """
-        try:
-            record_path = self.list_sample[index][2]
-            record = torch.load(record_path)
-            
-            # Get fine-grained label
-            fine_label = self.list_sample[index][1]
-            if fine_label not in self.label_list:
-                raise ValueError(f"Unknown label: {fine_label}")
-            patient_label_fine = self.label_list.index(fine_label)
-            
-            # Get coarse-grained label
-            if patient_label_fine not in self.mapping:
-                raise KeyError(f"No mapping found for fine label: {patient_label_fine}")
-            patient_label_coarse = self.mapping[patient_label_fine]
-            
-            return record, [patient_label_coarse, patient_label_fine]
-            
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Record file not found: {record_path}")
-        except Exception as e:
-            raise RuntimeError(f"Error loading sample {index}: {e}")
-    

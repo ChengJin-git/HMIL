@@ -211,225 +211,106 @@ def compute_contrastive_loss(semantics_features: torch.Tensor,
     return contrastive_loss(semantics_features, patient_fine_labels) / len(semantics_features), tau
 
 
-def train_phase(model: torch.nn.Module,
-                optimizer: torch.optim.Optimizer,
-                dataloader: torch.utils.data.DataLoader,
-                epoch: int,
-                cfg: Any,
-                writer: torch.utils.tensorboard.SummaryWriter,
-                scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau) -> None:
+def _run_epoch(model: torch.nn.Module,
+               dataloader: torch.utils.data.DataLoader,
+               epoch: int,
+               cfg: Any,
+               optimizer: Optional[torch.optim.Optimizer] = None,
+               is_training: bool = True) -> Dict[str, float]:
     """
-    Training phase for one epoch.
-    
-    This function implements the training loop for one epoch, including:
+    Unified function for training/validation epoch.
+
+    This function implements the loop for one epoch, including:
     1. Forward pass
     2. Loss computation
-    3. Backward pass
+    3. Backward pass (if training)
     4. Metrics tracking
-    5. Logging
-    
+
     Args:
         model: PyTorch model
-        optimizer: PyTorch optimizer
-        dataloader: Training data loader
+        dataloader: Data loader
         epoch: Current epoch number
         cfg: Configuration object
-        writer: Tensorboard writer
-        scheduler: Learning rate scheduler
-    """
-    model.train()
-    metrics = TrainingMetrics()
-    logger = logging.getLogger(__name__)
-    
-    try:
-        for cell_images, patient_labels in tqdm(dataloader):
-            batch_attention_coarse = []
-            batch_attention_fine = []
-            batch_semantics = []
-            
-            batch_logits_coarse = []
-            batch_logits_fine = []
-            batch_labels_coarse = []
-            batch_labels_fine = []
-            
-            # Process each sample in the batch
-            for cell_image, patient_label in zip(cell_images, patient_labels):
-                cell_image = cell_image.cuda()
-                label_coarse = torch.tensor(patient_label[0]).cuda()
-                label_fine = torch.tensor(patient_label[1]).cuda()
-                
-                # Forward pass
-                attention_maps, logits, features = model(cell_image)
-                batch_semantics.append([features, label_fine])
-                
-                # Process outputs
-                logits_coarse = logits[0].squeeze()
-                logits_fine = logits[1].squeeze()
-                
-                batch_logits_coarse.append(logits_coarse.unsqueeze(0))
-                batch_logits_fine.append(logits_fine.unsqueeze(0))
-                batch_labels_coarse.append(label_coarse.unsqueeze(0))
-                batch_labels_fine.append(label_fine.unsqueeze(0))
-                
-                batch_attention_coarse.append(attention_maps[0])
-                batch_attention_fine.append(attention_maps[1])
-                
-                metrics.update_batch_metrics(logits_coarse, logits_fine, label_coarse, label_fine)
-            
-            # Compute losses
-            batch_logits_coarse = torch.cat(batch_logits_coarse, dim=0)
-            batch_logits_fine = torch.cat(batch_logits_fine, dim=0)
-            batch_labels_coarse = torch.cat(batch_labels_coarse, dim=0)
-            batch_labels_fine = torch.cat(batch_labels_fine, dim=0)
-            
-            loss_semantic_coarse, loss_semantic_fine, loss_regularization = compute_hierarchical_loss(
-                batch_logits_coarse, batch_logits_fine, batch_labels_coarse, batch_labels_fine, cfg
-            )
-            
-            loss_attention = compute_attention_matching_loss(batch_attention_coarse, batch_attention_fine, cfg)
-            
-            # Compute contrastive loss
-            semantics_features = torch.stack([sem[0] for sem in batch_semantics])
-            patient_fine_labels = torch.stack([sem[1] for sem in batch_semantics])
-            loss_contrastive, tau = compute_contrastive_loss(semantics_features, patient_fine_labels, epoch, cfg)
-            
-            # Combine losses
-            alpha = 1 - (epoch / cfg.num_epochs)**2
-            loss_classification = loss_semantic_fine + loss_regularization
-            loss = alpha * loss_semantic_coarse + loss_classification + (1 - alpha) * loss_contrastive
-            
-            # Update metrics
-            metrics.metrics['loss_semantic_coarse'] += loss_semantic_coarse.data.cpu().numpy()
-            metrics.metrics['loss_semantic_fine'] += loss_semantic_fine.data.cpu().numpy()
-            metrics.metrics['loss_semantic'] += (loss_semantic_coarse + loss_semantic_fine).data.cpu().numpy()
-            metrics.metrics['loss_regularization'] += loss_regularization.data.cpu().numpy()
-            metrics.metrics['loss_attention'] += loss_attention.data.cpu().numpy()
-            metrics.metrics['loss_contrastive'] += loss_contrastive.data.cpu().numpy()
-            metrics.metrics['loss'] += loss.data.cpu().numpy()
-            
-            # Store alpha and tau for final metrics
-            metrics.metrics['alpha'] = alpha
-            metrics.metrics['tau'] = tau
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        
-        # Compute final metrics
-        metrics.metrics['auc_coarse'], metrics.metrics['auc_fine'] = metrics.compute_auc_scores(
-            cfg.n_class[0], cfg.n_class[1]
-        )
-        
-        # Normalize and log metrics
-        epoch_metrics = metrics.normalize_metrics(len(dataloader))
-        print_metrics(epoch_metrics, 'train')
-        
-        # Print classification reports
-        logits_coarse = torch.cat(metrics.logits_coarse, dim=0)
-        logits_fine = torch.cat(metrics.logits_fine, dim=0)
-        labels_coarse = torch.cat(metrics.labels_coarse, dim=0)
-        labels_fine = torch.cat(metrics.labels_fine, dim=0)
-        
-        logger.info("\n" + classification_report(labels_coarse, torch.argmax(logits_coarse, dim=1), digits=4))
-        logger.info("\n" + classification_report(labels_fine, torch.argmax(logits_fine, dim=1), digits=4))
-        
-        # Log to tensorboard
-        for k, v in epoch_metrics.items():
-            writer.add_scalar(f'train/{k}', v, epoch)
-        
-        scheduler.step(epoch_metrics['loss'])
-        
-    except Exception as e:
-        logger.error(f"Error in training phase: {e}")
-        raise
+        optimizer: PyTorch optimizer (required if is_training=True)
+        is_training: Whether this is a training phase
 
-
-def validation_phase(model: torch.nn.Module,
-                    dataloader: torch.utils.data.DataLoader,
-                    epoch: int,
-                    cfg: Any,
-                    writer: torch.utils.tensorboard.SummaryWriter) -> Dict[str, float]:
-    """
-    Validation phase for one epoch.
-    
-    This function implements the validation loop for one epoch, including:
-    1. Forward pass
-    2. Metrics computation
-    3. Logging
-    
-    Args:
-        model: PyTorch model
-        dataloader: Validation data loader
-        epoch: Current epoch number
-        cfg: Configuration object
-        writer: Tensorboard writer
-        
     Returns:
-        Dictionary of validation metrics
+        Dictionary of epoch metrics
     """
-    model.eval()
+    # Set model mode
+    if is_training:
+        if optimizer is None:
+            raise ValueError("Optimizer is required for training phase")
+        model.train()
+    else:
+        model.eval()
+
     metrics = TrainingMetrics()
     logger = logging.getLogger(__name__)
-    
+
+    # Context manager for gradient computation
+    context = torch.no_grad() if not is_training else torch.enable_grad()
+
     try:
-        with torch.no_grad():
-            for cell_images, patient_labels in tqdm(dataloader):
+        with context:
+            for cell_images, patient_labels in tqdm(dataloader, desc=f"{'Train' if is_training else 'Val'} Epoch {epoch}"):
                 batch_attention_coarse = []
                 batch_attention_fine = []
                 batch_semantics = []
-                
+
                 batch_logits_coarse = []
                 batch_logits_fine = []
                 batch_labels_coarse = []
                 batch_labels_fine = []
-                
+
                 # Process each sample in the batch
                 for cell_image, patient_label in zip(cell_images, patient_labels):
                     cell_image = cell_image.cuda()
                     label_coarse = torch.tensor(patient_label[0]).cuda()
                     label_fine = torch.tensor(patient_label[1]).cuda()
-                    
+
                     # Forward pass
                     attention_maps, logits, features = model(cell_image)
                     batch_semantics.append([features, label_fine])
-                    
+
                     # Process outputs
                     logits_coarse = logits[0].squeeze()
                     logits_fine = logits[1].squeeze()
-                    
+
                     batch_logits_coarse.append(logits_coarse.unsqueeze(0))
                     batch_logits_fine.append(logits_fine.unsqueeze(0))
                     batch_labels_coarse.append(label_coarse.unsqueeze(0))
                     batch_labels_fine.append(label_fine.unsqueeze(0))
-                    
+
                     batch_attention_coarse.append(attention_maps[0])
                     batch_attention_fine.append(attention_maps[1])
-                    
+
                     metrics.update_batch_metrics(logits_coarse, logits_fine, label_coarse, label_fine)
-                
+
                 # Compute losses
                 batch_logits_coarse = torch.cat(batch_logits_coarse, dim=0)
                 batch_logits_fine = torch.cat(batch_logits_fine, dim=0)
                 batch_labels_coarse = torch.cat(batch_labels_coarse, dim=0)
                 batch_labels_fine = torch.cat(batch_labels_fine, dim=0)
-                
+
                 loss_semantic_coarse, loss_semantic_fine, loss_regularization = compute_hierarchical_loss(
                     batch_logits_coarse, batch_logits_fine, batch_labels_coarse, batch_labels_fine, cfg
                 )
-                
+
                 loss_attention = compute_attention_matching_loss(batch_attention_coarse, batch_attention_fine, cfg)
-                
+
                 # Compute contrastive loss
                 semantics_features = torch.stack([sem[0] for sem in batch_semantics])
                 patient_fine_labels = torch.stack([sem[1] for sem in batch_semantics])
                 loss_contrastive, tau = compute_contrastive_loss(semantics_features, patient_fine_labels, epoch, cfg)
-                
+
                 # Combine losses
+                # Following Eq. (6) in the paper: L = β·(L_ce^(c) + L_la + L_ba) + (1-β)·L_reg + L_ce^(f)
+                # where β = 1 - e/E (dynamic weighting coefficient)
                 alpha = 1 - (epoch / cfg.num_epochs)**2
                 loss_classification = loss_semantic_fine + loss_regularization
-                loss = alpha * loss_semantic_coarse + loss_classification + (1 - alpha) * loss_contrastive
-                
+                loss = alpha * (loss_semantic_coarse + loss_attention) + loss_classification + (1 - alpha) * loss_contrastive
+
                 # Update metrics
                 metrics.metrics['loss_semantic_coarse'] += loss_semantic_coarse.data.cpu().numpy()
                 metrics.metrics['loss_semantic_fine'] += loss_semantic_fine.data.cpu().numpy()
@@ -438,35 +319,78 @@ def validation_phase(model: torch.nn.Module,
                 metrics.metrics['loss_attention'] += loss_attention.data.cpu().numpy()
                 metrics.metrics['loss_contrastive'] += loss_contrastive.data.cpu().numpy()
                 metrics.metrics['loss'] += loss.data.cpu().numpy()
-                
+
                 # Store alpha and tau for final metrics
                 metrics.metrics['alpha'] = alpha
                 metrics.metrics['tau'] = tau
-            
+
+                # Backward pass (only in training mode)
+                if is_training:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
         # Compute final metrics
         metrics.metrics['auc_coarse'], metrics.metrics['auc_fine'] = metrics.compute_auc_scores(
             cfg.n_class[0], cfg.n_class[1]
         )
-        
+
         # Normalize and log metrics
         epoch_metrics = metrics.normalize_metrics(len(dataloader))
-        print_metrics(epoch_metrics, 'val')
-        
+        phase_name = 'train' if is_training else 'val'
+        print_metrics(epoch_metrics, phase_name)
+
         # Print classification reports
         logits_coarse = torch.cat(metrics.logits_coarse, dim=0)
         logits_fine = torch.cat(metrics.logits_fine, dim=0)
         labels_coarse = torch.cat(metrics.labels_coarse, dim=0)
         labels_fine = torch.cat(metrics.labels_fine, dim=0)
-        
+
+        logger.info(f"\n{phase_name.upper()} - Coarse Classification Report:")
         logger.info("\n" + classification_report(labels_coarse, torch.argmax(logits_coarse, dim=1), digits=4))
+        logger.info(f"\n{phase_name.upper()} - Fine Classification Report:")
         logger.info("\n" + classification_report(labels_fine, torch.argmax(logits_fine, dim=1), digits=4))
-        
-        # Log to tensorboard
-        for k, v in epoch_metrics.items():
-            writer.add_scalar(f'val/{k}', v, epoch)
-            
+
         return epoch_metrics
-        
+
     except Exception as e:
-        logger.error(f"Error in validation phase: {e}")
+        logger.error(f"Error in {'training' if is_training else 'validation'} phase: {e}")
         raise
+
+
+def run_epoch(model: torch.nn.Module,
+              dataloader: torch.utils.data.DataLoader,
+              epoch: int,
+              cfg: Any,
+              writer: torch.utils.tensorboard.SummaryWriter,
+              optimizer: Optional[torch.optim.Optimizer] = None,
+              scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau] = None,
+              is_training: bool = True) -> Dict[str, float]:
+    """
+    Run one epoch of training or validation.
+
+    Args:
+        model: PyTorch model
+        dataloader: Data loader
+        epoch: Current epoch number
+        cfg: Configuration object
+        writer: Tensorboard writer
+        optimizer: PyTorch optimizer (required for training)
+        scheduler: Learning rate scheduler (optional, only for training)
+        is_training: Whether this is a training epoch
+
+    Returns:
+        Dictionary of metrics
+    """
+    metrics = _run_epoch(model, dataloader, epoch, cfg, optimizer=optimizer, is_training=is_training)
+
+    # Log to tensorboard
+    phase = 'train' if is_training else 'val'
+    for k, v in metrics.items():
+        writer.add_scalar(f'{phase}/{k}', v, epoch)
+
+    # Update learning rate if scheduler is provided (only during training)
+    if is_training and scheduler is not None:
+        scheduler.step(metrics['loss'])
+
+    return metrics

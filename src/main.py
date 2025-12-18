@@ -10,9 +10,10 @@ from trainer_manager import TrainingManager
 
 # Setup PyTorch backend
 torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True 
-torch.autograd.set_detect_anomaly = True
-warnings.filterwarnings('ignore')
+torch.backends.cudnn.benchmark = True
+torch.autograd.set_detect_anomaly(True)
+# Only filter specific warnings instead of all
+warnings.filterwarnings('ignore', category=UserWarning)
 
 def load_config(config_path: str):
     """
@@ -53,14 +54,14 @@ def main():
     try:
         # Load configuration
         cfg = load_config(args.config)
-        
+
         # Setup GPU
         os.environ['CUDA_VISIBLE_DEVICES'] = cfg.gpus
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f'[device] device set to: {device}')
-        
+
         # Create training manager
-        trainer = TrainingManager(cfg, device)
+        trainer = TrainingManager(cfg)
         
         # Parse training folds
         training_folds = [int(f) for f in cfg.folds.split(',')]

@@ -22,14 +22,13 @@ import importlib.util
 import sys
 from omegaconf import OmegaConf
 
-from utils import rm_n_mkdir
-from loss import print_metrics
-from models import ResNetMTL
-from dataset import TrainDataset_hierarchy, ValDataset_hierarchy
+from utils import rm_n_mkdir, print_metrics
+from models import HMIL
+from dataset import HierarchicalDataset
 
 torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True 
-warnings.filterwarnings('ignore')
+torch.backends.cudnn.benchmark = True
+warnings.filterwarnings('ignore', category=UserWarning)
 
 def load_config(config_path: str):
     """
@@ -54,19 +53,21 @@ def load_config(config_path: str):
     except Exception as e:
         raise RuntimeError(f"Error loading config file: {e}")
 
-def test_phase(model, dataloader, best_acc, checkpoint_path):
+def test_phase(model, dataloader, best_acc, checkpoint_path, cfg):
     """
     Test phase for model evaluation.
-    
+
     Args:
         model: PyTorch model
         dataloader: Test data loader
         best_acc: Best accuracy so far
         checkpoint_path: Path to save best model
-        
+        cfg: Configuration object
+
     Returns:
         Best accuracy
     """
+    model.eval()
     metrics = defaultdict(float)
     epoch_samples = 0
     correct_coarse = 0
@@ -78,47 +79,53 @@ def test_phase(model, dataloader, best_acc, checkpoint_path):
     logits_fine_all = []
     label_coarse_all = []
     label_fine_all = []
-    
-    for cell_imgs, patient_label in dataloader:
-        cell_imgs = cell_imgs.cuda()
-        patient_label_coarse = patient_label[0].cuda()
-        patient_label_fine = patient_label[1].cuda()
 
-        with torch.no_grad():
-            A_raw, logits = model.test(cell_imgs)
-        
-        logits_coarse = logits[0]
-        logits_fine = logits[1]                       
-            
-        loss_semantic = torch.nn.CrossEntropyLoss()(logits_coarse, patient_label_coarse)
-        loss_semantic += torch.nn.CrossEntropyLoss()(logits_fine, patient_label_fine)
-        
-        loss = loss_semantic
-        logits_out_coarse = logits_coarse
-        logits_coarse_all.append(logits_out_coarse)
-        label_coarse_all.append(patient_label_coarse)
-        correct_coarse += torch.argmax(logits_out_coarse, dim=1).eq(patient_label_coarse).sum().item()
-        total_coarse += logits_out_coarse.shape[0]
-        
-        logits_out_fine = logits_fine
-        logits_fine_all.append(logits_out_fine)
-        label_fine_all.append(patient_label_fine)
-        correct_fine += torch.argmax(logits_out_fine, dim=1).eq(patient_label_fine).sum().item()
-        total_fine += logits_out_fine.shape[0]
-        
-        metrics['loss_semantic'] += loss_semantic.data.cpu().numpy() 
-        metrics['loss'] += loss.data.cpu().numpy()
+    with torch.no_grad():
+        for cell_imgs, patient_label in dataloader:
+            # Process batch
+            for cell_img, patient_label in zip(cell_imgs, patient_label):
+                cell_img = cell_img.cuda()
+                label_coarse = torch.tensor(patient_label[0]).cuda()
+                label_fine = torch.tensor(patient_label[1]).cuda()
 
-        epoch_samples += 1
+                A_raw, logits = model.test(cell_img)
+
+                logits_coarse = logits[0].squeeze()
+                logits_fine = logits[1].squeeze()
+
+                loss_semantic = torch.nn.CrossEntropyLoss()(logits_coarse.unsqueeze(0), label_coarse.unsqueeze(0))
+                loss_semantic += torch.nn.CrossEntropyLoss()(logits_fine.unsqueeze(0), label_fine.unsqueeze(0))
+
+                loss = loss_semantic
+                logits_coarse_all.append(logits_coarse.unsqueeze(0))
+                label_coarse_all.append(label_coarse.unsqueeze(0))
+                correct_coarse += torch.argmax(logits_coarse, dim=0).eq(label_coarse).sum().item()
+                total_coarse += 1
+
+                logits_fine_all.append(logits_fine.unsqueeze(0))
+                label_fine_all.append(label_fine.unsqueeze(0))
+                correct_fine += torch.argmax(logits_fine, dim=0).eq(label_fine).sum().item()
+                total_fine += 1
+
+                metrics['loss_semantic'] += loss_semantic.data.cpu().numpy()
+                metrics['loss'] += loss.data.cpu().numpy()
+
+                epoch_samples += 1
 
     logits_coarse_all = torch.cat(logits_coarse_all, dim=0)
     logits_fine_all = torch.cat(logits_fine_all, dim=0)
     label_coarse_all = torch.cat(label_coarse_all, dim=0)
     label_fine_all = torch.cat(label_fine_all, dim=0)
-    metrics['patient_acc_coarse'] = (correct_coarse/total_coarse) * epoch_samples
-    metrics['patient_acc_fine'] = (correct_fine/total_fine) * epoch_samples
 
-    print_metrics(metrics, epoch_samples, 'val')
+    # Fix: Don't multiply by epoch_samples
+    metrics['patient_acc_coarse'] = correct_coarse / total_coarse
+    metrics['patient_acc_fine'] = correct_fine / total_fine
+
+    # Normalize metrics
+    for k in ['loss_semantic', 'loss']:
+        metrics[k] /= epoch_samples
+
+    print_metrics(metrics, 'test')
 
     auc_score_coarse = roc_auc_score(label_coarse_all.cpu(), F.softmax(logits_coarse_all)[:, 1].detach().cpu())
     auc_score_fine = roc_auc_score(label_fine_all.cpu(), F.softmax(logits_fine_all).detach().cpu(), multi_class='ovr')
@@ -142,25 +149,31 @@ def test_phase(model, dataloader, best_acc, checkpoint_path):
     
     return best_acc
 
-def build_model():
-    model = ResNetMTL(cfg.n_class, freeze=cfg.freeze, pretrained=cfg.pretrained).cuda()
-        
-    for name,parameters in model.named_parameters():
-        print(name,':',parameters.shape)
-    
+def build_model(cfg):
+    """Build model with configuration"""
+    model = HMIL(
+        n_classes=cfg.n_class,
+        dropout=getattr(cfg, 'dropout', False)
+    ).cuda()
+
+    for name, parameters in model.named_parameters():
+        print(name, ':', parameters.shape)
+
     return model
 
-def build_dataset():
+def build_dataset(cfg):
+    """Build datasets with configuration"""
     train_splits = pickle.load(open(cfg.train_splits, 'rb'))
     val_splits = pickle.load(open(cfg.val_splits, 'rb'))
     test_splits = pickle.load(open(cfg.test_splits, 'rb'))
-    dataset_train = TrainDataset_hierarchy(train_splits, cfg)
+
+    dataset_train = HierarchicalDataset(train_splits, cfg)
     print('Train dataset size:', len(train_splits))
-    dataset_val = ValDataset_hierarchy(val_splits, cfg)
+    dataset_val = HierarchicalDataset(val_splits, cfg)
     print('Val dataset size:', len(val_splits))
-    dataset_test = ValDataset_hierarchy(test_splits, cfg)
+    dataset_test = HierarchicalDataset(test_splits, cfg)
     print('Test dataset size:', len(test_splits))
-    
+
     return dataset_train, dataset_val, dataset_test
 
 if __name__ == '__main__':
@@ -209,30 +222,29 @@ if __name__ == '__main__':
 
     best_loss = 1e10
     best_acc = 0
-    
+
     ## build dataset
-    dataset_train, dataset_val, dataset_test = build_dataset()
+    dataset_train, dataset_val, dataset_test = build_dataset(cfg)
 
     dataloaders = {
-      'train': DataLoader(dataset_train, batch_size=cfg.train_batch_size, shuffle=True, 
+      'train': DataLoader(dataset_train, batch_size=cfg.train_batch_size, shuffle=True,
                           num_workers=cfg.num_workers, pin_memory=True),
-      'val': DataLoader(dataset_val, batch_size=cfg.test_batch_size, shuffle=False, 
+      'val': DataLoader(dataset_val, batch_size=cfg.test_batch_size, shuffle=False,
                         num_workers=cfg.num_workers, pin_memory=True),
-      'test': DataLoader(dataset_test, batch_size=cfg.test_batch_size, shuffle=False, 
+      'test': DataLoader(dataset_test, batch_size=cfg.test_batch_size, shuffle=False,
                              num_workers=cfg.num_workers, pin_memory=True)
     }
-    
+
     ## build models
-    model = build_model().cuda()
+    model = build_model(cfg).cuda()
     # model = nn.DataParallel(model)
-    
+
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg.lr)
-    
+
     if cfg.pretrained_path != "":
         checkpoint = torch.load(cfg.pretrained_path)
-        print(model.load_state_dict(checkpoint, strict=False))
         model.load_state_dict(checkpoint, strict=False)
         print("load pretrained weights from %s" % cfg.pretrained_path)
-    
-    best_val_acc = test_phase(model, dataloaders['val'], best_acc, checkpoint_path)
-    best_test_acc = test_phase(model, dataloaders['test'], best_acc, checkpoint_path)
+
+    best_val_acc = test_phase(model, dataloaders['val'], best_acc, checkpoint_path, cfg)
+    best_test_acc = test_phase(model, dataloaders['test'], best_acc, checkpoint_path, cfg)

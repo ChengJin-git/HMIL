@@ -89,128 +89,170 @@ class HMIL(nn.Module):
 	def __init__(self, n_classes: List[int], dropout: bool = False):
 		"""
 		Initialize the hierarchical MIL model
-		
+
 		Args:
 			n_classes: List of [coarse_classes, fine_classes]
 			dropout: Whether to use dropout
 		"""
 		super().__init__()
-		
+
 		self.n_classes = n_classes
-		
-		# Network architecture
-		size = [1024, 256, 128, 64]
-		
+
+		# Network architecture dimensions
+		self.feature_dim = 1024
+		self.reduced_dim = 256
+		self.attention_hidden_dim = 128
+		self.attention_output_dim = 64
+
 		# Feature extraction layers
 		self.feature_extractor = nn.Sequential(
-			nn.Linear(size[0], size[1]),
+			nn.Linear(self.feature_dim, self.reduced_dim),
 			nn.ReLU(),
-			nn.Linear(size[1], size[0])
+			nn.Linear(self.reduced_dim, self.feature_dim)
 		)
-		
+
 		self.feature_reducer = nn.Sequential(
-			nn.Linear(size[0], size[1])
+			nn.Linear(self.feature_dim, self.reduced_dim)
 		)
-		
-		# Attention networks
-		self.coarse_attention = nn.Sequential(
-			GatedAttention(L=size[0], D=size[1], dropout=dropout, n_classes=n_classes[0])
+
+		# Attention networks with clear parameter names
+		self.coarse_attention = GatedAttention(
+			input_dim=self.feature_dim,
+			hidden_dim=self.reduced_dim,
+			dropout=dropout,
+			n_classes=n_classes[0]
 		)
-		
-		self.fine_attention = nn.Sequential(
-			GatedAttention(L=size[1], D=size[3], dropout=dropout, n_classes=n_classes[1])
+
+		self.fine_attention = GatedAttention(
+			input_dim=self.reduced_dim,
+			hidden_dim=self.attention_output_dim,
+			dropout=dropout,
+			n_classes=n_classes[1]
 		)
-		
+
 		# Classifiers
-		self.coarse_classifier = nn.Linear(size[0], 1)
-		self.fine_classifier = nn.Linear(size[1], 1)
-		
+		self.coarse_classifier = nn.Linear(self.feature_dim, n_classes[0])
+		self.fine_classifier = nn.Linear(self.reduced_dim, n_classes[1])
+
 		initialize_weights(self)
 		
-	def _process_features(self, 
-						 x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	def _extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 		"""
-		Process input features through the network
-		
+		Extract hierarchical features from input
+
 		Args:
 			x: Input tensor
-			
+
 		Returns:
-			Tuple of (coarse features, fine features, normalized fine features)
+			Tuple of (coarse_features, fine_features)
 		"""
 		x = x.squeeze()
-		h1 = self.feature_extractor(x)
-		h2 = self.feature_reducer(h1)
-		
-		# Apply attention
-		A1, _ = self.coarse_attention(h1)
-		A2, _ = self.fine_attention(h2)
-		
+		coarse_features = self.feature_extractor(x)
+		fine_features = self.feature_reducer(coarse_features)
+		return coarse_features, fine_features
+
+	def _compute_attention(self,
+						  coarse_features: torch.Tensor,
+						  fine_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+		"""
+		Compute attention weights for both levels
+
+		Args:
+			coarse_features: Coarse level features
+			fine_features: Fine level features
+
+		Returns:
+			Tuple of (coarse_attention, fine_attention)
+		"""
+		A1, _ = self.coarse_attention(coarse_features)
+		A2, _ = self.fine_attention(fine_features)
+
 		# Transpose and apply softmax
 		A1 = F.softmax(torch.transpose(A1, 1, 0), dim=1)
 		A2 = F.softmax(torch.transpose(A2, 1, 0), dim=1)
-		
-		# Compute weighted features
-		M1 = torch.mm(A1, h1)
-		M2 = torch.mm(A2, h2)
-		
-		return M1, M2, F.normalize(M2, p=2, dim=1)
-		
-	def _compute_logits(self, 
-					   M1: torch.Tensor, 
+
+		return A1, A2
+
+	def _aggregate_features(self,
+						   attention_coarse: torch.Tensor,
+						   attention_fine: torch.Tensor,
+						   coarse_features: torch.Tensor,
+						   fine_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		"""
+		Aggregate features using attention weights
+
+		Args:
+			attention_coarse: Coarse attention weights
+			attention_fine: Fine attention weights
+			coarse_features: Coarse level features
+			fine_features: Fine level features
+
+		Returns:
+			Tuple of (aggregated_coarse, aggregated_fine, normalized_fine)
+		"""
+		M1 = torch.mm(attention_coarse, coarse_features)
+		M2 = torch.mm(attention_fine, fine_features)
+		normalized_M2 = F.normalize(M2, p=2, dim=1)
+
+		return M1, M2, normalized_M2
+
+	def _compute_logits(self,
+					   M1: torch.Tensor,
 					   M2: torch.Tensor) -> List[torch.Tensor]:
 		"""
 		Compute classification logits
-		
+
 		Args:
-			M1: Coarse level features
-			M2: Fine level features
-			
+			M1: Coarse level aggregated features
+			M2: Fine level aggregated features
+
 		Returns:
 			List of [coarse_logits, fine_logits]
 		"""
-		logits_h1 = self.coarse_classifier(M1).permute(1, 0)
-		logits_h2 = self.fine_classifier(M2).permute(1, 0)
-		return [logits_h1, logits_h2]
-		
+		logits_coarse = self.coarse_classifier(M1)
+		logits_fine = self.fine_classifier(M2)
+		return [logits_coarse, logits_fine]
+
 	def test(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
 		"""
-		Test forward pass
-		
+		Test forward pass (no gradient computation needed)
+
 		Args:
 			x: Input tensor
-			
+
 		Returns:
 			Tuple of (attention maps, logits)
 		"""
-		M1, M2, _ = self._process_features(x)
+		# Extract features once
+		coarse_features, fine_features = self._extract_features(x)
+
+		# Compute attention
+		A1, A2 = self._compute_attention(coarse_features, fine_features)
+
+		# Aggregate and classify
+		M1, M2, _ = self._aggregate_features(A1, A2, coarse_features, fine_features)
 		logits = self._compute_logits(M1, M2)
-		
-		# Get attention maps
-		A1, _ = self.coarse_attention(self.feature_extractor(x.squeeze()))
-		A2, _ = self.fine_attention(self.feature_reducer(self.feature_extractor(x.squeeze())))
-		A1 = F.softmax(torch.transpose(A1, 1, 0), dim=1)
-		A2 = F.softmax(torch.transpose(A2, 1, 0), dim=1)
-		
+
 		return [A1, A2], logits
-		
+
 	def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
 		"""
-		Forward pass
-		
+		Forward pass for training
+
 		Args:
 			x: Input tensor
-			
+
 		Returns:
 			Tuple of (attention maps, logits, normalized fine features)
 		"""
-		M1, M2, normalized_M2 = self._process_features(x)
+		# Extract features once (avoid redundant computation)
+		coarse_features, fine_features = self._extract_features(x)
+
+		# Compute attention
+		A1, A2 = self._compute_attention(coarse_features, fine_features)
+
+		# Aggregate and classify
+		M1, M2, normalized_M2 = self._aggregate_features(A1, A2, coarse_features, fine_features)
 		logits = self._compute_logits(M1, M2)
-		
-		# Get attention maps
-		A1, _ = self.coarse_attention(self.feature_extractor(x.squeeze()))
-		A2, _ = self.fine_attention(self.feature_reducer(self.feature_extractor(x.squeeze())))
-		A1 = F.softmax(torch.transpose(A1, 1, 0), dim=1)
-		A2 = F.softmax(torch.transpose(A2, 1, 0), dim=1)
-		
+
 		return [A1, A2], logits, normalized_M2

@@ -11,11 +11,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
-from trainer import train_phase, validation_phase
+from trainer import run_epoch
 from utils import rm_n_mkdir, build_dataset, collate_fn, save_checkpoint
-from models import HMIL, ResNetMTL
-from dataset import TrainDataset_hierarchy, ValDataset_hierarchy
-from trainer import TrainingMetrics
+from models import HMIL
+from dataset import HierarchicalDataset
 
 # Configure logging
 logging.basicConfig(
@@ -86,10 +85,10 @@ class TrainingManager:
     def _build_datasets(self) -> None:
         """Build datasets and dataloaders"""
         try:
-            # Build datasets
-            self.dataset_train = TrainDataset_hierarchy(self.cfg.train_splits, self.cfg)
-            self.dataset_val = ValDataset_hierarchy(self.cfg.val_splits, self.cfg)
-            
+            # Build datasets using unified class
+            self.dataset_train = HierarchicalDataset(self.cfg.train_splits, self.cfg)
+            self.dataset_val = HierarchicalDataset(self.cfg.val_splits, self.cfg)
+
             # Build dataloaders
             self.dataloaders = {
                 'train': DataLoader(
@@ -97,20 +96,22 @@ class TrainingManager:
                     batch_size=self.cfg.train_batch_size,
                     shuffle=True,
                     num_workers=self.cfg.num_workers,
-                    pin_memory=True
+                    pin_memory=True,
+                    collate_fn=collate_fn
                 ),
                 'val': DataLoader(
                     self.dataset_val,
                     batch_size=self.cfg.test_batch_size,
                     shuffle=False,
                     num_workers=self.cfg.num_workers,
-                    pin_memory=True
+                    pin_memory=True,
+                    collate_fn=collate_fn
                 )
             }
-            
+
             logger.info(f"Training dataset size: {len(self.dataset_train)}")
             logger.info(f"Validation dataset size: {len(self.dataset_val)}")
-            
+
         except Exception as e:
             logger.error(f"Error building datasets: {e}")
             raise
@@ -118,17 +119,18 @@ class TrainingManager:
     def _build_model(self) -> None:
         """Build and initialize the model"""
         try:
-            self.model = ResNetMTL(
-                n_class=self.cfg.n_class,
-                freeze=self.cfg.freeze,
-                pretrained=self.cfg.pretrained
+            # Use HMIL model as the main model
+            self.model = HMIL(
+                n_classes=self.cfg.n_class,
+                dropout=getattr(self.cfg, 'dropout', False)
             ).to(self.device)
-            
+
             if torch.cuda.device_count() > 1:
+                logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
                 self.model = nn.DataParallel(self.model)
-            
+
             logger.info("Model built successfully")
-            
+
         except Exception as e:
             logger.error(f"Error building model: {e}")
             raise
@@ -169,7 +171,7 @@ class TrainingManager:
     def train(self) -> None:
         """
         Execute training process
-        
+
         Includes:
         1. Training loop
         2. Validation evaluation
@@ -180,38 +182,40 @@ class TrainingManager:
             for epoch in range(self.cfg.epochs):
                 self.current_epoch = epoch
                 logger.info(f"Starting epoch {epoch + 1}/{self.cfg.epochs}")
-                
+
                 # Training phase
-                train_metrics = train_phase(
-                    self.model,
-                    self.dataloaders['train'],
-                    self.optimizer,
-                    self.device,
-                    self.cfg
+                train_metrics = run_epoch(
+                    model=self.model,
+                    dataloader=self.dataloaders['train'],
+                    epoch=epoch,
+                    cfg=self.cfg,
+                    writer=self.writer,
+                    optimizer=self.optimizer,
+                    scheduler=self.scheduler,
+                    is_training=True
                 )
-                
+
                 # Validation phase
-                val_metrics = validation_phase(
-                    self.model,
-                    self.dataloaders['val'],
-                    self.device,
-                    self.cfg
+                val_metrics = run_epoch(
+                    model=self.model,
+                    dataloader=self.dataloaders['val'],
+                    epoch=epoch,
+                    cfg=self.cfg,
+                    writer=self.writer,
+                    is_training=False
                 )
-                
-                # Update learning rate
-                self.scheduler.step(val_metrics['loss'])
-                
+
                 # Log metrics
                 self._log_metrics(train_metrics, val_metrics)
-                
+
                 # Save best model
                 self._save_best_model(val_metrics)
-                
+
                 # Save checkpoint
                 self._save_checkpoint(val_metrics)
-                
+
                 logger.info(f"Completed epoch {epoch + 1}")
-                
+
         except Exception as e:
             logger.error(f"Error during training: {e}")
             raise
@@ -219,15 +223,16 @@ class TrainingManager:
     def _log_metrics(self, train_metrics: Dict[str, float], val_metrics: Dict[str, float]) -> None:
         """
         Log training and validation metrics
-        
+
         Args:
             train_metrics: Training phase metrics
             val_metrics: Validation phase metrics
         """
-        for phase, metrics in [('train', train_metrics), ('val', val_metrics)]:
-            for metric_name, value in metrics.items():
-                self.writer.add_scalar(f'{phase}/{metric_name}', value, self.current_epoch)
-                logger.info(f"{phase} {metric_name}: {value:.4f}")
+        # Metrics are already logged to tensorboard in train_phase and validation_phase
+        # Just log to console here
+        logger.info(f"Epoch {self.current_epoch + 1} Summary:")
+        logger.info(f"  Train Loss: {train_metrics.get('loss', 0):.4f}, Train Acc (Coarse): {train_metrics.get('patient_acc_coarse', 0):.4f}, Train Acc (Fine): {train_metrics.get('patient_acc_fine', 0):.4f}")
+        logger.info(f"  Val Loss: {val_metrics.get('loss', 0):.4f}, Val Acc (Coarse): {val_metrics.get('patient_acc_coarse', 0):.4f}, Val Acc (Fine): {val_metrics.get('patient_acc_fine', 0):.4f}")
     
     def _save_best_model(self, val_metrics: Dict[str, float]) -> None:
         """
@@ -357,8 +362,15 @@ class TrainingManager:
             since = time.time()
             
             try:
-                train_phase(model, optimizer, dataloaders['train'], epoch, self.cfg, writer)
-                best_auc = validation_phase(model, dataloaders['val'], best_auc, epoch, self.cfg, writer, is_test=False)
+                train_metrics = run_epoch(model, dataloaders['train'], epoch, self.cfg, writer,
+                                         optimizer=optimizer, is_training=True)
+                val_metrics = run_epoch(model, dataloaders['val'], epoch, self.cfg, writer,
+                                       is_training=False)
+
+                # Update best AUC
+                current_auc = val_metrics.get('auc_fine', 0)
+                if current_auc > best_auc:
+                    best_auc = current_auc
                 
                 time_elapsed = time.time() - since
                 self.logger.info(f'[log] epoch time: {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
